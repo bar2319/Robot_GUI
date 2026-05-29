@@ -1,0 +1,21 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python byte-code
+__pycache__/
+*.py[cod]
+
+# Run logs produced by the GUI
+logs/
+
+# OS / editor clutter
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# pyqtgraph / Qt cache
+*.qmlc
