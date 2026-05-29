@@ -107,6 +107,9 @@ class MainWindow(QMainWindow,
         self._run_log: list[str] = []
         self._run_logging: bool = False
 
+        # Tracks last known error per node so we only log on state changes.
+        self._logged_motor_errors: dict[int, int] = {}
+
         self._apply_dark_theme()
 
         # INA219 powerbank monitor — init after UI so labels exist.
@@ -134,13 +137,14 @@ class MainWindow(QMainWindow,
         # Middle: splitter with tabs left, log right
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_single_motor_tab(), "Single Motor")
-        tabs.addTab(self._build_pid_calibration_tab(), "PID Calibration")
-        tabs.addTab(self._build_all_motors_tab(), "All Motors")
-        tabs.addTab(self._build_locomotion_tab(), "Locomotion")
-        tabs.addTab(self._build_one_leg_tab(), "One Leg")
-        self.main_splitter.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_single_motor_tab(), "Single Motor")
+        self.tabs.addTab(self._build_pid_calibration_tab(), "PID Calibration")
+        self._all_motors_tab_idx = self.tabs.addTab(
+            self._build_all_motors_tab(), "All Motors")
+        self.tabs.addTab(self._build_locomotion_tab(), "Locomotion")
+        self.tabs.addTab(self._build_one_leg_tab(), "One Leg")
+        self.main_splitter.addWidget(self.tabs)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -576,21 +580,55 @@ class MainWindow(QMainWindow,
         self._status_poll_count += 1
         request_vbus = (self._status_poll_count % 5 == 0)
 
+        # Only update the All Motors table when that tab is actually visible.
+        # Motor error logging and battery voltage always run.
+        tab_visible = (
+            hasattr(self, '_all_motors_tab_idx')
+            and self.tabs.currentIndex() == self._all_motors_tab_idx
+        )
+
         vbus_samples = []
 
         for (leg_idx, joint_idx), labels in self.all_motors_labels.items():
             spin = self.node_id_spins[(leg_idx, joint_idx)]
             nid = spin.value()
-            labels['node'].setText(str(nid))
+
+            # Encoder requests: only when tab is visible (locomotion code
+            # handles its own polling; we don't add 8 × 5 Hz of extra CAN
+            # traffic when the table isn't being watched).
             try:
-                self.bus.request_encoder_estimates(nid)
+                if tab_visible:
+                    self.bus.request_encoder_estimates(nid)
                 if request_vbus:
                     self.bus.request_bus_voltage_current(nid)
             except Exception:
                 pass
+
             fb = self.bus.get_feedback(nid)
             if fb is None:
                 continue
+
+            # ── Motor error logging (always active) ──────────────────────
+            prev_err = self._logged_motor_errors.get(nid, 0)
+            if fb.axis_error and fb.axis_error != prev_err:
+                self._logged_motor_errors[nid] = fb.axis_error
+                state_name = AXIS_STATE_NAMES.get(fb.axis_state, "?")
+                self._append_log(
+                    f"[MOTOR] Node {nid} error 0x{fb.axis_error:08X}"
+                    f"  state={state_name}")
+            elif not fb.axis_error and prev_err:
+                self._logged_motor_errors.pop(nid, None)
+                self._append_log(f"[MOTOR] Node {nid} error cleared")
+
+            # ── Battery voltage sample (always) ──────────────────────────
+            if fb.bus_voltage > 1.0:
+                vbus_samples.append(fb.bus_voltage)
+
+            # ── UI label updates (only when tab is open) ──────────────────
+            if not tab_visible:
+                continue
+
+            labels['node'].setText(str(nid))
             labels['state'].setText(AXIS_STATE_NAMES.get(fb.axis_state, "?"))
             labels['error'].setText(
                 f"0x{fb.axis_error:04X}" if fb.axis_error else "OK")
@@ -605,9 +643,6 @@ class MainWindow(QMainWindow,
                 labels['led'].set_color("#ffcc00")
             else:
                 labels['led'].set_color("gray")
-
-            if fb.bus_voltage > 1.0:
-                vbus_samples.append(fb.bus_voltage)
 
         # Update motor battery display from average vbus across all motors.
         if vbus_samples:

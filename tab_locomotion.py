@@ -51,6 +51,11 @@ class LocomotionMixin:
         self._trot_prev_tick_time: float = 0.0
         self._trot_last_enc_req: float = 0.0   # rate-limit encoder requests
 
+        # Position recording — list of (t, expected[8], actual[8]) tuples
+        self._trot_recording: list = []
+        self._trot_record_params: dict = {}
+        self._trot_replay_win = None  # keep window reference alive
+
     def _build_locomotion_tab(self) -> QWidget:
         widget = QWidget()
         scroll = QScrollArea()
@@ -477,6 +482,8 @@ class LocomotionMixin:
             if getattr(self, '_run_logging', False):
                 self._run_logging = False
                 self._save_run_log()
+            if getattr(self, '_trot_recording', []):
+                self._show_trot_replay()
 
     def _loco_set_status(self, text: str, color: str = "#3399ff"):
         self.lbl_loco_status.setText(text)
@@ -620,6 +627,16 @@ class LocomotionMixin:
         self._trot_hold_deadline_b = 0.0
         self._trot_prev_tick_time = 0.0
         self._trot_last_enc_req = 0.0
+
+        # Clear position recording for this run
+        self._trot_recording = []
+        self._trot_record_params = {
+            "step_len":     self.spin_step_len.value(),
+            "stand_h":      self.spin_stand_h.value(),
+            "lift_h":       self.spin_lift_h.value(),
+            "cycle_ms":     self.spin_cycle_time.value(),
+            "overshoot_pct": self.spin_trot_overshoot.value(),
+        }
 
         # Start run log — every _append_log call is captured until trot stops.
         import datetime as _dt
@@ -765,23 +782,16 @@ class LocomotionMixin:
 
         phase_inc = dt / cycle_time_s
 
-        # ── Rate-limited encoder requests during holds ─────────────────────
-        # Request encoder estimates for any held pair at ≤ 20 Hz so the
-        # position check below sees reasonably fresh data.
-        if self._trot_pair_a_held or self._trot_pair_b_held:
-            if now - self._trot_last_enc_req >= 0.05:
-                self._trot_last_enc_req = now
-                held_axes = []
-                if self._trot_pair_a_held:
-                    held_axes.extend([0, 1, 6, 7])
-                if self._trot_pair_b_held:
-                    held_axes.extend([2, 3, 4, 5])
-                for axis in held_axes:
-                    try:
-                        self.bus.request_encoder_estimates(
-                            self._loco_get_node_id(axis))
-                    except Exception:
-                        pass
+        # ── Rate-limited encoder requests (always, 20 Hz) ──────────────────
+        # Needed for: position hold checks, recording, and status display.
+        if now - self._trot_last_enc_req >= 0.05:
+            self._trot_last_enc_req = now
+            for axis in range(8):
+                try:
+                    self.bus.request_encoder_estimates(
+                        self._loco_get_node_id(axis))
+                except Exception:
+                    pass
 
         # ── Pair A: FL (axes 0,1) + RR (axes 6,7) ─────────────────────────
         if not self._trot_pair_a_held:
@@ -872,6 +882,26 @@ class LocomotionMixin:
             x_b, y_b = compute_xy(self._trot_pair_b_phase)
             self._loco_move_leg(2, 3, x_b, y_b)   # FR
             self._loco_move_leg(4, 5, x_b, y_b)   # RL
+
+        # ── Position recording (capped at 6 000 samples ≈ 30 s) ───────────
+        if len(self._trot_recording) < 6000:
+            # Expected: IK for current phase (held pairs use phase=0.5 = stance end)
+            exp_xy_a = compute_xy(0.5 if self._trot_pair_a_held
+                                  else self._trot_pair_a_phase)
+            exp_xy_b = compute_xy(0.5 if self._trot_pair_b_held
+                                  else self._trot_pair_b_phase)
+            expected = [0.0] * 8
+            for axis in (0, 1, 6, 7):
+                p = self._ik_get_angle(axis, *exp_xy_a)
+                if not math.isnan(p):
+                    expected[axis] = p
+            for axis in (2, 3, 4, 5):
+                p = self._ik_get_angle(axis, *exp_xy_b)
+                if not math.isnan(p):
+                    expected[axis] = p
+            actual = [self._loco_get_position(ax) for ax in range(8)]
+            self._trot_recording.append(
+                (now - self._loco_start_time, expected, actual))
 
     # ── Stand Up ─────────────────────────────────────────────────────────
 
@@ -1124,16 +1154,35 @@ class LocomotionMixin:
     # ── Locomotion Timer Dispatch ────────────────────────────────────────
 
     def _loco_tick(self):
-        if not self._loco_running or not self.bus.is_connected:
+        try:
+            if not self._loco_running or not self.bus.is_connected:
+                self._loco_stop()
+                return
+            if self._loco_mode == 'trot':
+                self._loco_tick_trot()
+            elif self._loco_mode == 'trot_align':
+                self._loco_tick_trot_align()
+            elif self._loco_mode == 'trot_finish':
+                self._loco_tick_trot_finish()
+            elif self._loco_mode == 'stand':
+                self._loco_tick_stand()
+            elif self._loco_mode == 'sit':
+                self._loco_tick_sit()
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            for line in tb.splitlines():
+                self._append_log(f"[CRASH] {line}")
+            # Flush run log immediately so the crash is captured on disk
+            if getattr(self, '_run_logging', False):
+                self._run_logging = False
+                self._save_run_log()
             self._loco_stop()
+
+    def _show_trot_replay(self):
+        if not self._trot_recording:
             return
-        if self._loco_mode == 'trot':
-            self._loco_tick_trot()
-        elif self._loco_mode == 'trot_align':
-            self._loco_tick_trot_align()
-        elif self._loco_mode == 'trot_finish':
-            self._loco_tick_trot_finish()
-        elif self._loco_mode == 'stand':
-            self._loco_tick_stand()
-        elif self._loco_mode == 'sit':
-            self._loco_tick_sit()
+        from trot_replay import TrotReplayWindow
+        win = TrotReplayWindow(self._trot_recording, self._trot_record_params)
+        win.show()
+        self._trot_replay_win = win  # prevent garbage collection
